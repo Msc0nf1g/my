@@ -661,6 +661,76 @@ MIN_FILE_SIZE = 32
 
 
 # --------------------------------------------------------------------------
+# Plain text (.md, .txt, .json): no signature, so look for sectors that are
+# valid UTF-8 without control characters.
+# --------------------------------------------------------------------------
+
+MIN_TEXT_SIZE = 32
+MAX_TEXT_SIZE = 50 * MB
+_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MD_HINT = re.compile(rb"(?m)^(#{1,6} |---\s*$|[-*+] |\d+\. |> )|\[\[|\]\(")
+
+
+def _decode_utf8(b):
+    """Text of b, tolerating a multibyte char split at either edge."""
+    i = 0
+    while i < 3 and i < len(b) and 0x80 <= b[i] <= 0xBF:
+        i += 1
+    try:
+        return b[i:].decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.start >= len(b) - i - 3 and e.reason == "unexpected end of data":
+            return b[i:i + e.start].decode("utf-8")
+        return None
+
+
+def is_text_sector(sec):
+    if len(sec) < SECTOR or b"\x00" in sec:
+        return False
+    s = _decode_utf8(sec)
+    return s is not None and not _CONTROL.search(s)
+
+
+def text_prefix(sec):
+    """Bytes at the start of sec that still look like the end of a text file.
+
+    Up to 3 leading continuation bytes are kept: they finish a character
+    split across the sector boundary.
+    """
+    b = sec.split(b"\x00", 1)[0]
+    i = 0
+    while i < 3 and i < len(b) and 0x80 <= b[i] <= 0xBF:
+        i += 1
+    try:
+        s = b[i:].decode("utf-8")
+    except UnicodeDecodeError as e:
+        s = b[i:i + e.start].decode("utf-8")
+    m = _CONTROL.search(s)
+    if m:
+        s = s[:m.start()]
+    return b[:i] + s.encode("utf-8")
+
+
+def _looks_like_text(b):
+    s = b.decode("utf-8", "ignore")
+    if not s:
+        return False
+    good = sum(1 for c in s if c.isalnum() or c.isspace())
+    return good >= 0.6 * len(s) and any(c.isspace() for c in s)
+
+
+def text_kind(b):
+    head = b[:4000].lstrip()
+    if head[:1] in (b"{", b"[") and b'":' in head:
+        return "json"
+    if head[:1] == b"<":
+        return "xml"
+    if _MD_HINT.search(b[:20000]):
+        return "md"
+    return "txt"
+
+
+# --------------------------------------------------------------------------
 # Main operations
 # --------------------------------------------------------------------------
 
@@ -755,7 +825,13 @@ def make_image(source, dest):
     return dest
 
 
-def carve(source, out_dir):
+def carve(source, out_dir, binary=True, text=False):
+    """Find files on source and save them to out_dir.
+
+    binary: save files found by signature (photos, video, documents...).
+    text:   save plain text runs (.md, .txt, .json). Binary files are still
+            located in text-only mode so that text inside them is skipped.
+    """
     out_dir = _abs(out_dir)
     if same_drive(source, out_dir):
         sys.exit("Нельзя сохранять файлы на ту же флешку — это затрёт данные.")
@@ -766,10 +842,31 @@ def carve(source, out_dir):
     counts = {}
     found = 0
     skip_until = 0
+    carved = []          # (start, end) of binary files, text is not looked for inside
+    run_start = None     # current run of text sectors
+    run_end = 0
     report_path = os.path.join(out_dir, "report.csv")
     with open(report_path, "w", newline="", encoding="utf-8") as rep:
         writer = csv.writer(rep)
         writer.writerow(["file", "type", "offset", "size"])
+
+        def save(pos, length, ext):
+            nonlocal found
+            found += 1
+            counts[ext] = counts.get(ext, 0) + 1
+            folder = os.path.join(out_dir, ext)
+            os.makedirs(folder, exist_ok=True)
+            name = "%05d.%s" % (found, ext)
+            _copy_out(r, pos, length, os.path.join(folder, name))
+            writer.writerow([os.path.join(ext, name), ext, pos, length])
+
+        def save_text(pos, length):
+            if length < MIN_TEXT_SIZE:
+                return
+            head = r.read_at(pos, min(length, 20000))
+            if _looks_like_text(head):
+                save(pos, length, text_kind(head))
+
         off = 0
         while r.size is None or off < r.size:
             data = r.read_at(off, SCAN_CHUNK + 64)
@@ -799,18 +896,40 @@ def carve(source, out_dir):
                 if not res or res[0] < MIN_FILE_SIZE:
                     continue
                 length, ext = res
-                found += 1
-                counts[ext] = counts.get(ext, 0) + 1
-                folder = os.path.join(out_dir, ext)
-                os.makedirs(folder, exist_ok=True)
-                name = "%05d.%s" % (found, ext)
-                _copy_out(r, pos, length, os.path.join(folder, name))
-                writer.writerow([os.path.join(ext, name), ext, pos, length])
+                if binary:
+                    save(pos, length, ext)
+                carved.append((pos, pos + length))
                 if reliable:
                     skip_until = pos + length
                 progress.show(off + start, found)
+
+            if text:
+                carved = sorted(rg for rg in carved if rg[1] > off)
+                j = 0
+                for s in range(0, body, SECTOR):
+                    pos = off + s
+                    while j < len(carved) and carved[j][1] <= pos:
+                        j += 1
+                    inside = j < len(carved) and carved[j][0] <= pos
+                    sec = data[s:s + SECTOR]
+                    if not inside and is_text_sector(sec):
+                        if run_start is None:
+                            run_start = pos
+                        run_end = pos + SECTOR
+                        if run_end - run_start >= MAX_TEXT_SIZE:
+                            save_text(run_start, run_end - run_start)
+                            run_start = None
+                        continue
+                    tail = b"" if inside else text_prefix(sec)
+                    if run_start is not None:
+                        save_text(run_start, run_end + len(tail) - run_start)
+                        run_start = None
+                    elif tail and not 0x80 <= tail[0] <= 0xBF:
+                        save_text(pos, len(tail))
             off += body
             progress.show(off, found)
+        if run_start is not None:
+            save_text(run_start, run_end - run_start)
     progress.show(off, found, force=True)
     print()
     r.close()
@@ -862,12 +981,20 @@ def interactive():
             print("Это та же флешка. Выберите папку на другом диске.")
             out = ""
     out = _abs(out)
+    print("\nЧто искать?\n"
+          "  1 — фото, видео, документы, архивы\n"
+          "  2 — только текстовые заметки (.md, .txt, .json)\n"
+          "  3 — всё сразу")
+    mode = ""
+    while mode not in ("1", "2", "3"):
+        mode = _ask("Введите 1, 2 или 3 [3]: ") or "3"
     ans = _ask("Сначала сделать полную копию флешки в файл? "
                "Рекомендуется, если на диске хватает места. [Д/н]: ").lower()
     if ans in ("", "д", "да", "y", "yes", "l"):
         source = make_image(source, os.path.join(out, "flash.img"))
         print()
-    carve(source, os.path.join(out, "files"))
+    folder = "text" if mode == "2" else "files"
+    carve(source, os.path.join(out, folder), binary=mode != "2", text=mode != "1")
 
 
 def main(argv=None):
@@ -884,12 +1011,17 @@ def main(argv=None):
     p_carve = sub.add_parser("carve", help="найти и сохранить файлы")
     p_carve.add_argument("source", help="буква диска (E:), PhysicalDriveN или файл-образ")
     p_carve.add_argument("out", help="папка для найденных файлов на другом диске")
+    p_carve.add_argument("--text", action="store_true",
+                         help="искать ещё и текстовые файлы (.md, .txt, .json)")
+    p_carve.add_argument("--text-only", action="store_true",
+                         help="искать только текстовые файлы")
     args = ap.parse_args(argv)
     source = normalize_source(args.source)
     if args.cmd == "image":
         make_image(source, args.dest)
     else:
-        carve(source, args.out)
+        carve(source, args.out, binary=not args.text_only,
+              text=args.text or args.text_only)
 
 
 if __name__ == "__main__":

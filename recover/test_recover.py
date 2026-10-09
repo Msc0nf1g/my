@@ -149,19 +149,45 @@ def ole_doc():
     return bytes(h) + fat + bytes(d) + rnd.randbytes(4 * 512)
 
 
-def build_image(path, files):
+def note(paragraphs):
+    words = "заметка обсидиан идея план проект встреча книга mark down список".split()
+    body = "\n\n".join(" ".join(rnd.choice(words) for _ in range(40)) for _ in range(paragraphs))
+    return ("---\ntags: [бекап]\n---\n# Заметка\n\n- [[Ссылка]]\n\n" + body + "\n").encode()
+
+
+def build_image(path, files, text_files=()):
     cluster = 4096
     with open(path, "wb") as f:
         f.write(bytes(MB))  # wiped FAT area
-        for data in files:
+        for data, zero_slack in [(d, False) for d in files] + [(d, True) for d in text_files]:
             f.write(data)
             slack = -f.tell() % cluster
-            f.write(rnd.randbytes(slack))  # old data in the cluster tail
+            # old data in the cluster tail; text files need it zeroed to end exactly
+            f.write(bytes(slack) if zero_slack else rnd.randbytes(slack))
             f.write(rnd.randbytes(cluster * rnd.randint(0, 3)))
         f.write(bytes(MB))
 
 
 MB = 1024 * 1024
+
+
+def check(out, want):
+    got = {}
+    for root, _, names in os.walk(out):
+        for n in names:
+            if n != "report.csv":
+                with open(os.path.join(root, n), "rb") as f:
+                    got[hashlib.sha256(f.read()).hexdigest()] = n
+    failures = 0
+    for data, ext in want:
+        name = got.pop(hashlib.sha256(data).hexdigest(), None)
+        ok = name is not None and name.endswith("." + ext)
+        failures += not ok
+        print("%-5s %-6s %s" % (ext, len(data), "OK" if ok else "FAIL (%s)" % name))
+    if got:
+        print("Extra files:", sorted(got.values()))
+        failures += len(got)
+    return failures
 
 
 def main():
@@ -176,32 +202,29 @@ def main():
         (mp4(b"isom"), "mp4"), (mp4(b"qt  "), "mov"), (mp4(b"heic"), "heic"),
         (mkv(), "mkv"), (avi(), "avi"), (ole_doc(), "doc"),
     ]
+    text_expected = [
+        (note(1), "md"), (note(12), "md"), (note(40), "md"),
+        (b"# short\nhello\n" * 3, "md"),
+        ('{"theme": "obsidian", "plugins": ["sync"]}\n'.encode(), "json"),
+        ("Просто текст без разметки, строка за строкой.\n".encode() * 30, "txt"),
+    ]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         img = os.path.join(tmp, "flash.img")
-        build_image(img, [d for d, _ in expected])
+        build_image(img, [d for d, _ in expected], [d for d, _ in text_expected])
 
         copy = recover.make_image(img, os.path.join(tmp, "copy.img"))
         with open(img, "rb") as a, open(copy, "rb") as b:
             assert a.read() == b.read(), "image copy differs"
 
-        out = os.path.join(tmp, "out")
-        recover.carve(img, out)
-        got = {}
-        for root, _, names in os.walk(out):
-            for n in names:
-                if n == "report.csv":
-                    continue
-                with open(os.path.join(root, n), "rb") as f:
-                    got[hashlib.sha256(f.read()).hexdigest()] = n
-        for data, ext in expected:
-            name = got.pop(hashlib.sha256(data).hexdigest(), None)
-            ok = name is not None and name.endswith("." + ext)
-            failures += not ok
-            print("%-5s %-6s %s" % (ext, len(data), "OK" if ok else "FAIL (%s)" % name))
-        if got:
-            print("Extra files:", sorted(got.values()))
-            failures += len(got)
+        for label, kwargs, want in (
+                ("files", {}, expected),
+                ("text only", {"binary": False, "text": True}, text_expected),
+                ("everything", {"text": True}, expected + text_expected)):
+            print("\n--- %s ---" % label)
+            out = os.path.join(tmp, label)
+            recover.carve(img, out, **kwargs)
+            failures += check(out, want)
 
     assert recover.same_drive(r"\\.\E:", r"E:\out")
     assert recover.same_drive(r"\\.\e:", r"E:\out")
